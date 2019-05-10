@@ -1,199 +1,119 @@
 #include "bc_adc_dma.h"
 
 
-
-//#define _MIC_NUMBER_OF_SAMPLES 4096
-#define _MIC_TIMER_PERIOD_DEBUG 0
-
-typedef enum
-{
-    MIC_STATE_READY = 0,
-    MIC_STATE_ENABLE = 1,
-    MIC_STATE_MEASURE = 2,
-    MIC_STATE_UPDATE = 3,
-    MIC_STATE_ERROR = 4
-
-} mic_state_t;
-
 typedef struct
 {
     uint8_t *buffer;
     size_t buffer_size;
-
     bc_adc_channel_t adc_channel;
-    mic_state_t state;
-    bc_tick_t timeout;
-    void (*update_callback)(void);
-    void (*error_callback)(void);
     bool circular;
 
     uint16_t prescaler;
     uint16_t autoreload;
 
-    bc_scheduler_task_id_t task_id;
+    bool running;
 
-} mic_t;
+} bc_adc_dma;
 
-static mic_t _mic;
+static bc_adc_dma _bc_adc_dma;
 
-void mic_task(void *param);
-static void _mic_adc_init(void);
-static void _mic_tim6_init(uint16_t prescaler, uint16_t autoreload);
-static void _mic_dma_init(void);
-static bool _mic_adc_calibration(void);
+static void _bc_adc_dma_adc_init(void);
+static void _bc_adc_dma_tim6_init(uint16_t prescaler, uint16_t autoreload);
+static void _bc_adc_dma_dma_init(void);
 
-void mic_init(uint8_t *buffer, size_t buffer_size)
+void bc_adc_dma_init(uint8_t *buffer, size_t buffer_size)
 {
-    memset(&_mic, 0, sizeof(_mic));
+    memset(&_bc_adc_dma, 0, sizeof(_bc_adc_dma));
 
-    _mic.buffer = buffer;
-    _mic.buffer_size = buffer_size;
+    _bc_adc_dma.buffer = buffer;
+    _bc_adc_dma.buffer_size = buffer_size;
 
-    _mic_adc_init();
-    _mic_adc_calibration();
+    bc_dma_init();
 
-    _mic.task_id = bc_scheduler_register(mic_task, NULL, 0);
-
+    _bc_adc_dma_adc_init();
+    _bc_adc_dma_dma_init();
 }
 
-void mic_task(void *param)
+void _bc_adc_dma_start()
 {
-    switch(_mic.state)
+    bc_scheduler_disable_sleep();
+
+    _bc_adc_dma_tim6_init(_bc_adc_dma.prescaler, _bc_adc_dma.autoreload);
+
+    // Reinit the DMA
+    _bc_adc_dma_dma_init();
+
+    // Set ADC channel
+    ADC1->CHSELR = 1 << _bc_adc_dma.adc_channel;
+
+    // Enable DMA - this must be set after calibration phase!
+    ADC1->CFGR1 |= ADC_CFGR1_DMAEN;
+
+    if (_bc_adc_dma.circular)
     {
-        case MIC_STATE_READY:
-        {
-            break;
-        }
-        case MIC_STATE_MEASURE:
-        {
-            break;
-        }
-        case MIC_STATE_ENABLE:
-        {
-            if (_mic.timeout < bc_tick_get())
-            {
-                _mic.timeout = 0;
-
-                bc_scheduler_disable_sleep();
-
-                _mic_tim6_init(_mic.prescaler, _mic.autoreload);
-
-                // Reinit the DMA
-                _mic_dma_init();
-
-                // Set ADC channel 0
-                ADC1->CHSELR = 1 << _mic.adc_channel;
-
-                // Enable DMA - this must be set after calibration phase!
-                ADC1->CFGR1 |= ADC_CFGR1_DMAEN;
-
-                if (_mic.circular)
-                {
-                    ADC1->CFGR1 |= ADC_CFGR1_DMACFG;
-                }
-
-                // Configure trigger by timer TRGO signal
-                // Rising edge, TRG0 (TIM6_TRGO)
-                ADC1->CFGR1 |= ADC_CFGR1_EXTEN_0;
-
-                // Start the AD measurement
-                ADC1->CR |= ADC_CR_ADSTART;
-
-                // Start sampling timer
-                TIM6->CR1 |= TIM_CR1_CEN;
-
-                _mic.state = MIC_STATE_MEASURE;
-            }
-
-            break;
-        }
-        case MIC_STATE_UPDATE:
-        {
-            _mic.state = MIC_STATE_READY;
-
-            if (_mic.update_callback != NULL)
-            {
-                _mic.update_callback();
-            }
-            break;
-        }
-        case MIC_STATE_ERROR:
-        {
-            _mic.state = MIC_STATE_READY;
-
-            if (_mic.error_callback != NULL)
-            {
-                _mic.error_callback();
-            }
-            break;
-        }
-        default:
-        {
-            break;
-        }
+        ADC1->CFGR1 |= ADC_CFGR1_DMACFG;
     }
 
-    bc_scheduler_plan_current_relative(10);
+    // Configure trigger by timer TRGO signal
+    // Rising edge, TRG0 (TIM6_TRGO)
+    ADC1->CFGR1 |= ADC_CFGR1_EXTEN_0;
+
+    // Start the AD measurement
+    ADC1->CR |= ADC_CR_ADSTART;
+
+    // Start sampling timer
+    TIM6->CR1 |= TIM_CR1_CEN;
+
+    _bc_adc_dma.running = true;
 }
 
-static bool _mic_adc_calibration(void)
+bool bc_adc_dma_start(bc_adc_channel_t adc_channel, uint16_t prescaler, uint16_t autoreload)
 {
-    if ((ADC1->CR & ADC_CR_ADEN) == 0)
+    if (_bc_adc_dma.running)
     {
         return false;
     }
 
-    // Perform ADC calibration
-    ADC1->CR |= ADC_CR_ADCAL;
+    _bc_adc_dma.prescaler = prescaler;
+    _bc_adc_dma.autoreload = autoreload;
+    _bc_adc_dma.adc_channel = adc_channel;
+    _bc_adc_dma.circular = false;
 
-    while ((ADC1->ISR & ADC_ISR_EOCAL) == 0)
-    {
-        continue;
-    }
+    _bc_adc_dma_start();
 
     return true;
 }
 
-bool mic_measure(bc_adc_channel_t adc_channel, uint16_t prescaler, uint16_t autoreload)
+bool bc_adc_dma_start_circular(bc_adc_channel_t adc_channel, uint16_t prescaler, uint16_t autoreload)
 {
-    if (_mic.state != MIC_STATE_READY)
+    if (_bc_adc_dma.running)
     {
         return false;
     }
 
-    _mic.state = MIC_STATE_ENABLE;
+    _bc_adc_dma.prescaler = prescaler;
+    _bc_adc_dma.autoreload = autoreload;
+    _bc_adc_dma.adc_channel = adc_channel;
+    _bc_adc_dma.circular = true;
 
-    _mic.prescaler = prescaler;
-    _mic.autoreload = autoreload;
-
-    _mic.timeout = bc_tick_get() + 500;
-    _mic.adc_channel = adc_channel;
-    _mic.circular = false;
+    _bc_adc_dma_start();
 
     return true;
 }
 
-bool mic_measure_circular(bc_adc_channel_t adc_channel, uint16_t prescaler, uint16_t autoreload)
+bool bc_adc_dma_stop()
 {
-    if (_mic.state != MIC_STATE_READY)
-    {
-        return false;
-    }
+    // Disable counter
+    TIM6->CR1 &= ~TIM_CR1_CEN;
 
-    _mic.state = MIC_STATE_ENABLE;
+    bc_dma_channel_stop(BC_DMA_CHANNEL_1);
 
-    _mic.prescaler = prescaler;
-    _mic.autoreload = autoreload;
-
-    _mic.timeout = bc_tick_get() + 500;
-    _mic.adc_channel = adc_channel;
-    _mic.circular = true;
+    _bc_adc_dma.running = false;
 
     return true;
 }
 
-
-static void _mic_tim6_init(uint16_t prescaler, uint16_t autoreload)
+static void _bc_adc_dma_tim6_init(uint16_t prescaler, uint16_t autoreload)
 {
     // Enable TIM6 clock
     RCC->APB1ENR |= RCC_APB1ENR_TIM6EN;
@@ -214,69 +134,9 @@ static void _mic_tim6_init(uint16_t prescaler, uint16_t autoreload)
 
     // Configure update event TRGO to ADC
     TIM6->CR2 |= TIM_CR2_MMS_1;
-
-#if _MIC_TIMER_PERIOD_DEBUG
-    // Debug IRQ
-    TIM6->DIER |= TIM_DIER_UIE;
-    NVIC_EnableIRQ(TIM6_DAC_IRQn);
-#endif
 }
 
-#if _MIC_TIMER_PERIOD_DEBUG
-// Debug the period
-void TIM6_IRQHandler(void)
-{
-    TIM6->SR &= ~TIM_SR_UIF;
-
-    static uint8_t toggle = false;
-
-    if (toggle)
-    {
-        GPIOH->BSRR = GPIO_BSRR_BS_1;
-    } else {
-        GPIOH->BSRR = GPIO_BSRR_BR_1;
-    }
-    toggle = !toggle;
-}
-#endif
-
-void DMA1_Channel1_IRQHandler(void)
-{
-    if ((DMA1->ISR & DMA_ISR_GIF1) != 0)
-    {
-        if ((DMA1->ISR & DMA_ISR_TEIF1) != 0)
-        {
-            // DMA Error
-            _mic.state = MIC_STATE_ERROR;
-
-            //bc_scheduler_enable_sleep();
-        }
-        else if ((DMA1->ISR & DMA_ISR_TCIF1) != 0)
-        {
-            // DMA Transfer complete
-            _mic.state = MIC_STATE_UPDATE;
-
-            if (!_mic.circular)
-            {
-                // Stop sampling timer
-                TIM6->CR1 &= ~TIM_CR1_CEN;
-                bc_scheduler_enable_sleep();
-            }
-
-            // Clear DMA flag
-            DMA1->IFCR |= DMA_IFCR_CTCIF1;
-
-            //bc_scheduler_enable_sleep();
-        }
-        else if ((DMA1->ISR & DMA_ISR_HTIF1) != 0)
-        {
-            // Clear DMA flag
-            DMA1->IFCR |= DMA_IFCR_CHTIF1;
-        }
-    }
-}
-
-static void _mic_adc_init(void)
+static void _bc_adc_dma_adc_init(void)
 {
     // Enable ADC clock
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
@@ -300,61 +160,30 @@ static void _mic_adc_init(void)
     ADC1->CR |= ADC_CR_ADVREGEN;
 }
 
-static void _mic_dma_init(void)
+static void _bc_adc_dma_dma_init(void)
 {
-    // DMA1, Channel 1, Request number 0
-    DMA_Channel_TypeDef *dma_channel = DMA1_Channel1;
-
-    // Enable DMA1
-    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
-
-    // Errata workaround
-    RCC->AHBENR;
-
-    // Disable DMA
-    dma_channel->CCR &= ~DMA_CCR_EN;
-
-    // Peripheral to memory
-    dma_channel->CCR &= ~DMA_CCR_DIR;
-
-    // Memory data size 8 bits
-    dma_channel->CCR &= ~DMA_CCR_MSIZE_Msk;
-
-    // Peripheral data size 8 bits
-    dma_channel->CCR &= ~DMA_CCR_PSIZE_Msk;
-
-    // DMA Mode
-    if (_mic.circular)
+    static bc_dma_channel_config_t _bc_spi_dma_config =
     {
-        dma_channel->CCR |= DMA_CCR_CIRC;
-    }
-    else
-    {
-        dma_channel->CCR &= ~DMA_CCR_CIRC_Msk;
-    }
+        .request = BC_DMA_REQUEST_0,
+        .direction = BC_DMA_DIRECTION_TO_RAM,
+        .data_size_memory = BC_DMA_SIZE_1,
+        .data_size_peripheral = BC_DMA_SIZE_1,
+        .mode = BC_DMA_MODE_CIRCULAR,
+        .address_peripheral = (void *)&ADC1->DR,
+        .priority = BC_DMA_PRIORITY_HIGH
+    };
 
-    // Set memory incrementation
-    dma_channel->CCR |= DMA_CCR_MINC;
+    // Setup DMA channel
+    _bc_spi_dma_config.address_memory = (void *)_bc_adc_dma.buffer;
+    _bc_spi_dma_config.length = _bc_adc_dma.buffer_size;
 
-    // DMA channel selection
-    DMA1_CSELR->CSELR &= ~DMA_CSELR_C1S_Msk;
+    _bc_spi_dma_config.mode = (_bc_adc_dma.circular) ? BC_DMA_MODE_CIRCULAR : BC_DMA_MODE_STANDARD;
 
-    // Configure DMA channel data length
-    dma_channel->CNDTR = _mic.buffer_size;
+    bc_dma_channel_config(BC_DMA_CHANNEL_1, &_bc_spi_dma_config);
+    bc_dma_channel_run(BC_DMA_CHANNEL_1);
+}
 
-    // Configure DMA channel source address
-    dma_channel->CPAR = (uint32_t) &ADC1->DR;
-
-    // Configure DMA channel destination address
-    dma_channel->CMAR = (uint32_t) _mic.buffer;
-
-    // Enable the transfer complete, half transfer and error interrupts
-    dma_channel->CCR |= DMA_CCR_TCIE | DMA_CCR_HTIE | DMA_CCR_TEIE;
-
-    // Enable DMA 1 channel 1 interrupt
-    NVIC_SetPriority(DMA1_Channel1_IRQn, 0);
-    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-
-    // Enable DMA
-    dma_channel->CCR |= DMA_CCR_EN;
+void bc_adc_dma_set_event_handler(void (*event_handler)(bc_dma_channel_t, bc_dma_event_t, void *), void *event_param)
+{
+    bc_dma_set_event_handler(BC_DMA_CHANNEL_1, event_handler, event_param);
 }
